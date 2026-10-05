@@ -86,3 +86,28 @@ transport failures.
 
 The committed checkpoint review is recorded separately in BRI-92 after this
 commit is exported and reviewed. No merge is requested.
+
+## Checkpoint review follow-up
+
+Real WebGPT reviewed the entire 846-line reviewer diff and 901-line bridge diff,
+then read the committed identity-listener source. Review `review-8fcfe84281d4`,
+conversation `6ac3902a-4cd8-83e8-b9c3-dfd4c183b730`, completed in five steps with
+`revise`: a POST with empty/missing/non-string-only `content.parts` could bypass
+the old conditional text validation and resolve the scope using UUID alone.
+
+That finding is fixed by rejecting missing submitted text before either text
+validation path or scope resolution. Five additional regressions prove these
+POSTs leave the capture unresolved. The guard does not resend anything.
+
+- Updated bridge full suite: **746 passed** in 296.71 seconds.
+- Updated reviewer full suite: **35 passed** in 16.21 seconds.
+- Updated focused identity/reconciliation suite: **48 passed**.
+- Doctor and a new real search → read → final succeeded after the guard.
+- The additional restart continuation captured its submitted UUID but backend
+  projection became HTTP 429, then bounded Phase 1 ended in HTTP 504. This is
+  retained as a failure, not PASS. Earlier same-conversation continuation at the
+  preceding checkpoint passed. No uncertain message was resent.
+
+Final continuation/checkpoint re-review results are recorded in the BRI-92
+checkpoint once the backend rate limit clears; the old completion recovery and
+its safety gates remain unchanged.

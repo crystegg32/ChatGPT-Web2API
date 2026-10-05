@@ -125,3 +125,18 @@ async def test_late_scoped_identity_does_not_require_dom_counts():
 def test_untrusted_baseline_cannot_recover_backend_identity(mode):
     a=TurnAnchor(sent_text="a *diff*", mode=mode, conversation_id_at_capture="conv")
     assert select_delivered_user(projection(), a, {"old"}, "conv") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [None, {}, {"parts": []}, {"parts": [""]},
+                                    {"parts": [None, 42, {"text": "a *diff*"}]}])
+async def test_missing_submitted_text_never_resolves_uuid(content):
+    listener=IdentityListener(MagicMock())
+    scope=listener.arm_capture_scope(expected_text_hash=hash_sent_text("a *diff*"),
+        expected_text="a *diff*", conversation_id="conv", target_id="tab")
+    post={"action": "next", "conversation_id": "conv", "messages": [
+        {"id": "12345678-1234-1234-1234-123456789abc", "author": {"role": "user"}, "content": content}]}
+    await listener._process_send_post(scope, {"params": {"request": {"postData": json.dumps(post)}}}, "")
+    assert not scope.future.done()
+    assert listener.fallback_reasons["submitted_text_missing"] == 1
+    scope.close()

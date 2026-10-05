@@ -349,19 +349,21 @@ class IdentityListener:
             # text-hash match if available (failure-mode D: multiple POSTs).
             parts = (m0.get("content") or {}).get("parts") or []
             body_text = "\n".join(str(p) for p in parts if isinstance(p, str))
-            if body_text:
-                body_hash = hashlib.sha256(body_text.encode("utf-8")).hexdigest()
-                if body_hash != scope.expected_text_hash:
-                    from .send_text import submitted_text_matches
-                    if scope.expected_text and submitted_text_matches(body_text, scope.expected_text):
-                        logger.info("identity_capture_serialized_text_match: uuid=%s seq=%d",
-                                    uuid, scope.send_sequence_id)
-                    else:
-                        # A different send must leave this scope unresolved.
-                        logger.debug(
-                            "identity_capture: text hash mismatch — not our send, leaving scope open"
-                        )
-                        return
+            if not body_text:
+                self._record_fallback_reason("submitted_text_missing")
+                return
+            body_hash = hashlib.sha256(body_text.encode("utf-8")).hexdigest()
+            if body_hash != scope.expected_text_hash:
+                from .send_text import submitted_text_matches
+                if scope.expected_text and submitted_text_matches(body_text, scope.expected_text):
+                    logger.info("identity_capture_serialized_text_match: uuid=%s seq=%d",
+                                uuid, scope.send_sequence_id)
+                else:
+                    # A different send must leave this scope unresolved.
+                    logger.debug(
+                        "identity_capture: text hash mismatch — not our send, leaving scope open"
+                    )
+                    return
 
             # Success — resolve the scope.
             self.capture_success_count += 1
