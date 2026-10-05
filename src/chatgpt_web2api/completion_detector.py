@@ -276,7 +276,7 @@ class CompletionDetector:
         must surface as auth expiry, not degrade to a generic stall (PR #39
         review finding #2 invariant — auth failure never degrades).
         """
-        from .cdp_driver import AuthExpiredError
+        from .cdp_driver import AuthExpiredError, ObservationRateLimitError
         from .turn_anchor import collapse_to_end_turn_status
 
         if not conv_id:
@@ -295,8 +295,8 @@ class CompletionDetector:
                               diagnostic=end_result.diagnostic, reconciled=status == "complete",
                               **_anchor_evidence(turn_anchor))
             return status == "complete"
-        except AuthExpiredError:
-            raise  # never swallow auth expiry — it must surface as auth expiry
+        except (AuthExpiredError, ObservationRateLimitError):
+            raise  # auth/rate-limit observation must surface, never degrade
         except Exception as e:
             logger.debug("Final reconciliation fetch failed: %s", e)
             return False
@@ -347,6 +347,7 @@ class CompletionDetector:
             AuthExpiredError,
             CDPJSError,
             GenerationStuckError,
+            ObservationRateLimitError,
             RateLimitError,
             StreamChunk,
         )
@@ -753,10 +754,9 @@ class CompletionDetector:
                             end_result.status, end_result.diagnostic,
                         )
                     # else: not_ready — no-op (do NOT set backend_fetch_failed).
-                except AuthExpiredError:
-                    # Auth failure must NEVER degrade to DOM fallback.
-                    # (PR #39 review finding #2 — the prior broad except
-                    # swallowed this, violating "auth failure never degrades.")
+                except (AuthExpiredError, ObservationRateLimitError):
+                    # Auth / observation rate-limit failures must NEVER degrade
+                    # to DOM fallback or continue polling toward a false 504.
                     raise
                 except Exception as e:
                     # Transport/backend failure — treat as fetch_failed so the
@@ -870,7 +870,7 @@ class CompletionDetector:
 
     async def _phase_one_backend_text(self, d, anchor, recent_checks):
         """Recover a completed text turn when DOM node-count detection drifts."""
-        from .cdp_driver import AuthExpiredError
+        from .cdp_driver import AuthExpiredError, ObservationRateLimitError
         from .turn_anchor import collapse_to_end_turn_status
 
         captured_id = getattr(anchor, "captured_user_message_id", None)
@@ -899,8 +899,8 @@ class CompletionDetector:
             _completion_trace("phase_1_backend_complete", conv_id_for_check=conv_id,
                               text_length=len(text.text), diagnostic=text.diagnostic, **_anchor_evidence(anchor))
             return text.text
-        except AuthExpiredError:
-            raise  # auth expiry never unlocks a fallback
+        except (AuthExpiredError, ObservationRateLimitError):
+            raise  # auth/rate-limit observation never unlocks a fallback
         except Exception as exc:
             _completion_trace("phase_1_backend_observation_failed", error_type=type(exc).__name__,
                               **_anchor_evidence(anchor))
