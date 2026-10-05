@@ -22,6 +22,7 @@ from .cdp_driver import (
     AuthExpiredError,
     CDPDriver,
     GenerationStuckError,
+    ObservationRateLimitError,
     RateLimitError,
     is_rate_limited_text,
 )
@@ -437,7 +438,7 @@ class APIServer:
         - Everything else stays a 500 ``server_error`` (a real failure, not
           retriable).
         """
-        if isinstance(exc, RateLimitError):
+        if isinstance(exc, (RateLimitError, ObservationRateLimitError)):
             retry_after = str(int(exc.retry_after))
             return web.json_response(
                 {
@@ -686,10 +687,9 @@ class APIServer:
                             ],
                         },
                     )
-        except RateLimitError as e:
-            # Mid-stream throttle (rare after pre-flight). Status is locked at
-            # 200, so we can't upgrade to 429; surface as an inline error chunk
-            # with a recognizable marker so clients can detect it.
+        except (RateLimitError, ObservationRateLimitError) as e:
+            # Mid-stream throttle / observation throttling after HTTP 200.
+            # Never retry the send here; surface an inline error marker.
             logger.warning("Mid-stream rate limit: %s", e)
             await self._send_sse(
                 resp,
