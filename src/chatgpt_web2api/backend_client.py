@@ -277,7 +277,11 @@ class BackendClient:
         on other non-OK status, and ``CDPJSError`` on transport failure.
         """
         from .backend_projection import CONVERSATION_PROJECTION_JS, TURN_PROJECTION_LIMIT
-        from .cdp_driver import AuthExpiredError, CDPJSError
+        from .cdp_driver import (
+            AuthExpiredError,
+            CDPJSError,
+            ObservationRateLimitError,
+        )
 
         d = self._driver
         await self._driver.ensure_token()
@@ -305,6 +309,11 @@ class BackendClient:
                 raise AuthExpiredError()
             if status == 404:
                 raise _Transient404(conversation_id)
+            if status == 429:
+                raise ObservationRateLimitError(
+                    f"ChatGPT backend projection rate limited for {conversation_id}; "
+                    "retry observation later and do not resend the turn."
+                )
             if status is not None:
                 raise RuntimeError(f"projection HTTP {status} for {conversation_id}")
         # Decode projection JS errors (the JS catches exceptions and returns
@@ -337,14 +346,18 @@ class BackendClient:
         Transport failures map to ``fetch_failed`` (caller keeps polling);
         auth failures propagate as ``AuthExpiredError`` (never degrades).
         """
-        from .cdp_driver import AuthExpiredError, CDPJSError
+        from .cdp_driver import (
+            AuthExpiredError,
+            CDPJSError,
+            ObservationRateLimitError,
+        )
         from .turn_anchor import TurnTextResult, select_text_for_turn
 
         try:
             mapping = await self._fetch_recent_conversation_projection(conversation_id)
             return select_text_for_turn(mapping, anchor)
-        except AuthExpiredError:
-            raise  # hard fail — never degrade on auth
+        except (AuthExpiredError, ObservationRateLimitError):
+            raise  # hard fail — auth/rate-limit observation never degrades
         except _Transient404:
             # Transient race — mapping not yet propagated. Treat as not_ready.
             return TurnTextResult("not_ready", diagnostic={"reason": "transient_404"})
@@ -364,7 +377,11 @@ class BackendClient:
         content-guard decision lives in the selector where the correlated
         node identity is known (ChatGPT round 4 refinement).
         """
-        from .cdp_driver import AuthExpiredError, CDPJSError
+        from .cdp_driver import (
+            AuthExpiredError,
+            CDPJSError,
+            ObservationRateLimitError,
+        )
         from .turn_anchor import TurnEndResult, select_end_turn_for_turn
 
         try:
@@ -372,8 +389,8 @@ class BackendClient:
             return select_end_turn_for_turn(
                 mapping, anchor, had_non_text_content=had_non_text_content
             )
-        except AuthExpiredError:
-            raise  # hard fail — never degrade on auth
+        except (AuthExpiredError, ObservationRateLimitError):
+            raise  # hard fail — auth/rate-limit observation never degrades
         except _Transient404:
             return TurnEndResult("not_ready", diagnostic={"reason": "transient_404"})
         except (CDPJSError, RuntimeError) as e:
