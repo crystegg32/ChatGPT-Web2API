@@ -471,7 +471,8 @@ class ChatGPTDom:
             from .cdp_driver import SendReadinessError
 
             raise SendReadinessError(f"Send failed: {result}")
-        logger.info("Message sent")
+        d._last_send_click_result = result
+        logger.info("Send click dispatched: %s", result)
         # Success: clear composer failure history and recover a half-open
         # breaker. Only after the message is confirmed sent — not after
         # type_message alone, since a successful type can still fail to send.

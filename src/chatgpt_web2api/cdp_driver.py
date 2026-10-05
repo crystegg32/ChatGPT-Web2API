@@ -1596,7 +1596,8 @@ class CDPDriver:
         Polls briefly (3s at 0.5s intervals). Never raises.
         """
         import time as _time
-        from .chatgpt_dom import COMPOSER_SELECTOR, COMPOSER_FALLBACK_SELECTOR
+
+        from .chatgpt_dom import COMPOSER_FALLBACK_SELECTOR, COMPOSER_SELECTOR
 
         pre_send_count = getattr(self, "_pre_send_user_count", None)
         if pre_send_count is None:
@@ -1665,6 +1666,7 @@ class CDPDriver:
         from .turn_anchor import TurnAnchor
 
         pre_send_wall = _time.time()
+        self._pre_send_user_ids = None
         conv_id = self._current_conv_id
 
         if conv_id is None:
@@ -1679,6 +1681,8 @@ class CDPDriver:
         try:
             mapping = await self._backend_client._fetch_recent_conversation_projection(conv_id)
             nodes = mapping.get("nodes") or {}
+            self._pre_send_user_ids = {node.get("id") or nid for nid, node in nodes.items()
+                                       if node.get("role") == "user"}
             # Find latest user + assistant nodes by create_time.
             latest_user_id, latest_user_ct = None, None
             latest_asst_id, latest_asst_ct = None, None
@@ -1758,8 +1762,11 @@ class CDPDriver:
         # The fallback anchor captures pre-send state (backend node-ids/times
         # or wall-clock) for dual-anchor correlation if UUID capture fails.
         fallback_anchor = await self._capture_pre_send_fallback_anchor(text)
+        from .send_confirmation import observe_send
+        await observe_send(self, "before_type", text, fallback_anchor)
         if self._identity_listener is not None and self._identity_listener.is_alive():
             capture_scope = self._identity_listener.arm_capture_scope(
+                expected_text=text,
                 expected_text_hash=hash_sent_text(text),
                 conversation_id=self._current_conv_id,
                 target_id=self._target_id,
@@ -1768,12 +1775,17 @@ class CDPDriver:
         try:
             # Type and send.
             await self.type_message(text)
-            await self.click_send()
+            await observe_send(self, "before_click", text, fallback_anchor)
+            click_result = await self.click_send()
+            await observe_send(self, "after_click", text, fallback_anchor,
+                               click_result=getattr(self, "_last_send_click_result", click_result))
 
             # A2 Step 6: wait for the IdentityListener to capture the UUID.
             captured_uuid = None
             if capture_scope is not None:
                 captured_uuid = await self._identity_listener.wait_for_captured_uuid(timeout=5.0)
+            await observe_send(self, "identity_wait_done", text,
+                               fallback_anchor.with_captured_id(captured_uuid))
 
             # P0 send acknowledgment (ChatGPT review, conv 6a52f0f3):
             # click_send dispatches synthetic mouse events — that proves the
@@ -1793,12 +1805,18 @@ class CDPDriver:
                 try:
                     acknowledged = await self._verify_send_acknowledged()
                     if acknowledged is False:  # explicitly False, not None
-                        raise SendReadinessError(
-                            "Send not acknowledged — click dispatched but no user "
-                            "message appeared (no UUID captured, user count unchanged, "
-                            "composer not cleared). The page may be overloaded or the "
-                            "send was rejected. Do NOT retry automatically."
-                        )
+                        await observe_send(self, "confirmation_timeout", text, fallback_anchor)
+                        from .send_confirmation import reconcile_send
+                        captured_uuid = await reconcile_send(self, fallback_anchor, capture_scope)
+                        if not captured_uuid:
+                            raise SendReadinessError(
+                                "Send not acknowledged — no submitted identity or unique new "
+                                "backend user turn with full matching text and cleared composer "
+                                "could be confirmed within the bounded reconciliation budget. "
+                                "Do NOT retry automatically."
+                            )
+                except AuthExpiredError:
+                    raise
                 except SendReadinessError:
                     raise
                 except Exception as ack_err:
