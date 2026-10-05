@@ -63,7 +63,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -74,6 +76,17 @@ if TYPE_CHECKING:
     from .config import ChatGPTConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _completion_trace(event: str, **evidence) -> None:
+    """Opt-in metadata only; never log prompts, reply text or browser secrets."""
+    if os.environ.get("W2A_COMPLETION_TRACE") == "1":
+        logger.info("completion_trace %s", json.dumps({"event": event, **evidence}, default=str))
+
+
+def _anchor_evidence(anchor) -> dict:
+    return {"anchor_mode": getattr(anchor, "mode", None),
+            "captured_user_message_id": getattr(anchor, "captured_user_message_id", None)}
 
 
 # A generation is considered "stuck" (vs. merely slow) if no DOM progress
@@ -267,6 +280,9 @@ class CompletionDetector:
         from .turn_anchor import collapse_to_end_turn_status
 
         if not conv_id:
+            _completion_trace("final_reconcile", conv_id_for_check=conv_id,
+                              reconciled=False, raw_status=None, collapsed_status=None,
+                              diagnostic={"reason": "no_conversation_id"}, **_anchor_evidence(turn_anchor))
             return False
         try:
             end_result = await d._fetch_end_turn_for_turn(
@@ -274,6 +290,10 @@ class CompletionDetector:
                 had_non_text_content=had_non_text_content,
             )
             status = collapse_to_end_turn_status(end_result)
+            _completion_trace("final_reconcile", conv_id_for_check=conv_id,
+                              raw_status=end_result.status, collapsed_status=status,
+                              diagnostic=end_result.diagnostic, reconciled=status == "complete",
+                              **_anchor_evidence(turn_anchor))
             return status == "complete"
         except AuthExpiredError:
             raise  # never swallow auth expiry — it must surface as auth expiry
@@ -333,6 +353,9 @@ class CompletionDetector:
         from .turn_anchor import collapse_to_end_turn_status
 
         d = self._driver
+        recent_backend_checks = deque(maxlen=8)
+        _completion_trace("start", initial_count=initial_count,
+                          conv_id_for_check=d._current_conv_id, **_anchor_evidence(turn_anchor))
 
         # P1: resolve the model class for structured error reporting.
         model_class = classify_model(model) if model else "default"
@@ -355,6 +378,7 @@ class CompletionDetector:
         deadline = time.monotonic() + timeout
         last_node_count = initial_count
         last_progress = time.monotonic()
+        last_phase_one_backend_check = 0.0
         while time.monotonic() < deadline:
             # First check for ChatGPT's rate-limit pop-up — if present, fail
             # fast with a clear error instead of waiting out the whole timeout.
@@ -389,10 +413,23 @@ class CompletionDetector:
                 last_progress = time.monotonic()
             if current_count > initial_count:
                 break
+            # DOM attributes can disappear while the backend has already completed.
+            # Only an exact captured user identity can unlock this path. Do not use
+            # text matching, old DOM action rows, or a transport failure as proof.
+            if (getattr(turn_anchor, "captured_user_message_id", None)
+                    and time.monotonic() - last_phase_one_backend_check >= 3.0):
+                last_phase_one_backend_check = time.monotonic()
+                backend_text = await self._phase_one_backend_text(d, turn_anchor, recent_backend_checks)
+                if backend_text:
+                    self.last_dom_text = backend_text
+                    yield StreamChunk(delta=backend_text)
+                    return
             if time.monotonic() - last_progress > PHASE_STALL_SECONDS:
+                await self._trace_phase_one_stall(d, turn_anchor, initial_count, current_count)
                 raise GenerationStuckError("phase_1_appear", time.monotonic() - last_progress)
             await asyncio.sleep(0.5)
         else:
+            await self._trace_phase_one_stall(d, turn_anchor, initial_count, last_node_count)
             raise GenerationStuckError("phase_1_appear", timeout)
 
         logger.info("Assistant message appeared, waiting for completion...")
@@ -686,6 +723,14 @@ class CompletionDetector:
                         had_non_text_content=had_non_text_content,
                     )
                     status = collapse_to_end_turn_status(end_result)
+                    check = {"raw_status": end_result.status, "collapsed_status": status,
+                             "diagnostic": end_result.diagnostic}
+                    recent_backend_checks.append(check)
+                    _completion_trace("backend_check", conv_id_for_check=conv_id_for_check,
+                                      has_action=has_action, last_dom_text_length=len(last_dom_text),
+                                      first_content_seen=first_content_seen,
+                                      backend_fetch_failed=status == "fetch_failed",
+                                      **check, **_anchor_evidence(turn_anchor))
                     if status == "complete":
                         # STRICT: end_turn AND usable content. The saw_thinking
                         # unlock lets us CONSULT the backend during thinking, but
@@ -794,6 +839,13 @@ class CompletionDetector:
                             model_class, generation_active_signal,
                         )
                         return  # generation completed — return normally
+                    _completion_trace("stall", phase="phase_2_stream",
+                                      stall_kind="hard_timeout" if hard_cap_hit else stall_kind,
+                                      conv_id_for_check=conv_id_for_check, has_action=has_action,
+                                      last_dom_text_length=len(last_dom_text), first_content_seen=first_content_seen,
+                                      backend_fetch_failed=backend_fetch_failed,
+                                      recent_backend_checks=list(recent_backend_checks),
+                                      final_reconcile_result=reconciled, **_anchor_evidence(turn_anchor))
                     # Reconciliation found no completion — raise structured error.
                     raise GenerationStuckError(
                         "phase_2_stream",
@@ -815,3 +867,76 @@ class CompletionDetector:
         # mirrored to self.* as they changed during the loop; the driver tail
         # reads them to emit the final-text suffix delta / non-text placeholder.
         return
+
+    async def _phase_one_backend_text(self, d, anchor, recent_checks):
+        """Recover a completed text turn when DOM node-count detection drifts."""
+        from .cdp_driver import AuthExpiredError
+        from .turn_anchor import collapse_to_end_turn_status
+
+        captured_id = getattr(anchor, "captured_user_message_id", None)
+        if not isinstance(captured_id, str) or not captured_id:
+            return None
+        try:
+            conv_id = await d._get_live_conversation_id_best_effort()
+            if not conv_id or (anchor.conversation_id_at_capture
+                               and conv_id != anchor.conversation_id_at_capture):
+                return None
+            end = await d._fetch_end_turn_for_turn(conv_id, anchor, had_non_text_content=False)
+            status = collapse_to_end_turn_status(end)
+            check = {"raw_status": end.status, "collapsed_status": status, "diagnostic": end.diagnostic}
+            recent_checks.append(check)
+            _completion_trace("phase_1_backend_check", conv_id_for_check=conv_id,
+                              has_action=None, last_dom_text_length=0, first_content_seen=False,
+                              backend_fetch_failed=status == "fetch_failed", **check, **_anchor_evidence(anchor))
+            if (status != "complete" or end.diagnostic.get("user_node") != captured_id
+                    or not end.diagnostic.get("assistant_node")):
+                return None
+            text = await d._fetch_text_for_turn(conv_id, anchor)
+            if (text.status != "matched" or not isinstance(text.text, str) or not text.text.strip()
+                    or text.diagnostic.get("user_node") != captured_id
+                    or text.diagnostic.get("assistant_node") != end.diagnostic["assistant_node"]):
+                return None
+            _completion_trace("phase_1_backend_complete", conv_id_for_check=conv_id,
+                              text_length=len(text.text), diagnostic=text.diagnostic, **_anchor_evidence(anchor))
+            return text.text
+        except AuthExpiredError:
+            raise  # auth expiry never unlocks a fallback
+        except Exception as exc:
+            _completion_trace("phase_1_backend_observation_failed", error_type=type(exc).__name__,
+                              **_anchor_evidence(anchor))
+            return None  # ambiguous/missing/error keeps the original bounded wait
+
+    async def _trace_phase_one_stall(self, d, turn_anchor, initial_count, current_count):
+        """Extra observation only after an already-decided stall; no completion change."""
+        if os.environ.get("W2A_COMPLETION_TRACE") != "1":
+            return
+        evidence = {"phase": "phase_1_appear", "initial_count": initial_count,
+                    "current_count": current_count, "has_action": None,
+                    "last_dom_text_length": 0, "first_content_seen": False,
+                    "backend_fetch_failed": False, "recent_backend_checks": [],
+                    "final_reconcile_result": None,
+                    "final_reconcile_note": "not invoked by phase_1 completion semantics",
+                    **_anchor_evidence(turn_anchor)}
+        try:
+            conv_id = await d._get_live_conversation_id_best_effort()
+            evidence["conv_id_for_check"] = conv_id
+            if conv_id:
+                from .turn_anchor import collapse_to_end_turn_status
+                result = await d._fetch_end_turn_for_turn(conv_id, turn_anchor,
+                                                         had_non_text_content=False)
+                evidence["observational_backend_check"] = {
+                    "raw_status": result.status, "collapsed_status": collapse_to_end_turn_status(result),
+                    "diagnostic": result.diagnostic}
+            evidence["dom_metadata"] = json.loads(await d._js_strict("""JSON.stringify({
+                role_nodes: Array.from(document.querySelectorAll('[data-message-author-role]')).map(
+                    e => ({role:e.getAttribute('data-message-author-role'),tag:e.tagName})),
+                turns: Array.from(document.querySelectorAll('[data-testid^="conversation-turn"]')).slice(-4).map(
+                    e => ({tag:e.tagName,testid:e.getAttribute('data-testid'),dataset:e.dataset,
+                           text_length:(e.innerText||'').length,code_length:Array.from(e.querySelectorAll('code')).reduce((n,c)=>n+(c.textContent||'').length,0)})),
+                articles: Array.from(document.querySelectorAll('article')).slice(-4).map(
+                    e=>({dataset:e.dataset,label:e.getAttribute('aria-label'),text_length:(e.innerText||'').length})),
+                markdown_count:document.querySelectorAll('.markdown').length
+            })"""))
+        except Exception as exc:
+            evidence["observation_error_type"] = type(exc).__name__
+        _completion_trace("stall", **evidence)
