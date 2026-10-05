@@ -173,6 +173,29 @@ class RateLimitError(RuntimeError):
         return cls(retry_after=retry_after)
 
 
+class ObservationRateLimitError(RuntimeError):
+    """Backend observation/read was rate limited after a send may have occurred.
+
+    Unlike RateLimitError, this MUST NOT be caught by retry_on_rate_limit(),
+    because retrying the surrounding send operation could duplicate an
+    uncertain/already-delivered user turn. Callers should surface this as
+    HTTP/MCP 429 and retry observation later, never resend automatically.
+    """
+
+    def __init__(
+        self,
+        message: str | None = None,
+        retry_after: int = RATE_LIMIT_DEFAULT_RETRY_AFTER,
+    ) -> None:
+        if message is None:
+            message = (
+                "ChatGPT backend observation rate limit reached. "
+                f"Retry observation in {retry_after}s; do not resend the turn."
+            )
+        super().__init__(message)
+        self.retry_after = int(retry_after)
+
+
 class AuthExpiredError(RuntimeError):
     """Raised when the ChatGPT access token is stale or rejected (HTTP 401).
 
