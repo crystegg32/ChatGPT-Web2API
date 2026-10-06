@@ -32,7 +32,13 @@ def submitted_text_matches(actual: str, expected: str) -> bool:
     def unlink(match):
         # The serializer escapes the target's parentheses; never discard a
         # changed destination or a differently named link.
-        label, target = match[1], _ESCAPE.sub(r"\1", match[2])
+        label, raw_target = match[1], match[2]
+        # JSON string URLs can include original trailing backslashes. When
+        # serialization duplicates the same escaped URL in label and target,
+        # preserve those backslashes for the full-text automaton below.
+        if label == raw_target:
+            return label
+        target = _ESCAPE.sub(r"\1", raw_target)
         return label if label == target else match[0]
 
     actual = _LINK.sub(unlink, actual)
