@@ -16,6 +16,7 @@ from .chatgpt_dom import (
 )
 from .send_text import submitted_text_matches
 from .turn_anchor import normalize_text
+from .projection_diagnostics import projection_phase
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,8 @@ async def observe_send(driver, phase, text, anchor=None, *, click_result=None):
             record.update({"anchor_mode": anchor.mode, "captured_user_message_id": anchor.captured_user_message_id,
                            "pre_send_latest_user_identity": anchor.latest_user_node_id})
         if conv:
-            projection = await driver._backend_client._fetch_recent_conversation_projection(conv)
+            with projection_phase("send_trace"):
+                projection = await driver._backend_client._fetch_recent_conversation_projection(conv)
             users = [n for n in projection.get("nodes", {}).values() if n.get("role") == "user"]
             record["backend_user_count"] = len(users)
             record["backend_exact_text_user_ids"] = [n.get("id") for n in users
@@ -105,7 +107,8 @@ async def reconcile_send(driver, anchor, scope, *, timeout=15.0):
                 # Backend-only recovery cannot borrow a preexisting fresh/degraded
                 # conversation or infer identity from timestamps alone.
                 if anchor.mode == "existing_conversation" and conv == anchor.conversation_id_at_capture:
-                    projection = await driver._backend_client._fetch_recent_conversation_projection(conv)
+                    with projection_phase("send_confirmation_reconciliation"):
+                        projection = await driver._backend_client._fetch_recent_conversation_projection(conv)
                     identity = select_delivered_user(projection, anchor,
                         getattr(driver, "_pre_send_user_ids", None), conv)
                     if identity:

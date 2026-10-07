@@ -440,6 +440,14 @@ class APIServer:
         """
         if isinstance(exc, (RateLimitError, ObservationRateLimitError)):
             retry_after = str(int(exc.retry_after))
+            metadata = {}
+            headers = {"Retry-After": retry_after}
+            if isinstance(exc, ObservationRateLimitError):
+                metadata = {"retry_after_source": exc.retry_after_source,
+                            "retry_after_reason": exc.retry_after_reason,
+                            "upstream_retry_after": exc.upstream_retry_after,
+                            "upstream_error": exc.upstream_error}
+                headers["X-Bridge-Retry-After-Source"] = exc.retry_after_source
             return web.json_response(
                 {
                     "error": {
@@ -447,10 +455,11 @@ class APIServer:
                         "type": "rate_limit_exceeded",
                         "param": None,
                         "code": "rate_limit_exceeded",
+                        **metadata,
                     }
                 },
                 status=429,
-                headers={"Retry-After": retry_after},
+                headers=headers,
             )
         if isinstance(exc, AuthExpiredError):
             return web.json_response(

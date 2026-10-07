@@ -233,6 +233,15 @@ def is_rate_limited_text(text: str) -> bool:
     return any(phrase in lowered for phrase in _RATE_LIMIT_PHRASES)
 
 
+@dataclass(frozen=True)
+class _CompletedTurnText:
+    conversation_id: str
+    anchor: object
+    user_id: str
+    assistant_id: str
+    text: str
+
+
 class CompletionDetector:
     """Generation-completion detection, composed by ``CDPDriver``.
 
@@ -254,6 +263,21 @@ class CompletionDetector:
         # Per-call results surfaced for the driver tail; reset each call.
         self.last_dom_text: str = ""
         self.had_non_text_content: bool = False
+        self._completed_turn_text: _CompletedTurnText | None = None
+
+    def take_completed_turn_text(self, conversation_id, anchor):
+        """One-use handoff of proven Phase 1 text, scoped to this exact turn."""
+        from .turn_anchor import TurnTextResult
+        evidence, self._completed_turn_text = self._completed_turn_text, None
+        if (evidence is None or evidence.conversation_id != conversation_id
+                or evidence.anchor != anchor
+                or not evidence.user_id
+                or evidence.user_id != getattr(anchor, "captured_user_message_id", None)
+                or not evidence.assistant_id or not evidence.text.strip()):
+            return None
+        return TurnTextResult("matched", evidence.text,
+            {"user_node": evidence.user_id, "assistant_node": evidence.assistant_id,
+             "source": "same_projection_phase_1_handoff"})
 
     async def _reconcile_before_stall(
         self, d, conv_id: str, turn_anchor, had_non_text_content: bool,
@@ -285,10 +309,12 @@ class CompletionDetector:
                               diagnostic={"reason": "no_conversation_id"}, **_anchor_evidence(turn_anchor))
             return False
         try:
-            end_result = await d._fetch_end_turn_for_turn(
-                conv_id, turn_anchor,
-                had_non_text_content=had_non_text_content,
-            )
+            from .projection_diagnostics import projection_phase
+            with projection_phase("pre_stall_reconciliation"):
+                end_result = await d._fetch_end_turn_for_turn(
+                    conv_id, turn_anchor,
+                    had_non_text_content=had_non_text_content,
+                )
             status = collapse_to_end_turn_status(end_result)
             _completion_trace("final_reconcile", conv_id_for_check=conv_id,
                               raw_status=end_result.status, collapsed_status=status,
@@ -366,6 +392,7 @@ class CompletionDetector:
         # Reset per-call results surfaced to the driver tail.
         self.last_dom_text = ""
         self.had_non_text_content = False
+        self._completed_turn_text = None
 
         # Wait for a new assistant message. The full `timeout` governs (was
         # capped at 60s, which killed slow-to-appear responses like image
@@ -719,10 +746,12 @@ class CompletionDetector:
                     # must NOT set backend_fetch_failed (would unlock the DOM
                     # fallback and risk completing off a prior turn's action
                     # row — the line-493 gate invariant).
-                    end_result = await d._fetch_end_turn_for_turn(
-                        conv_id_for_check, turn_anchor,
-                        had_non_text_content=had_non_text_content,
-                    )
+                    from .projection_diagnostics import projection_phase
+                    with projection_phase("phase_2_completion"):
+                        end_result = await d._fetch_end_turn_for_turn(
+                            conv_id_for_check, turn_anchor,
+                            had_non_text_content=had_non_text_content,
+                        )
                     status = collapse_to_end_turn_status(end_result)
                     check = {"raw_status": end_result.status, "collapsed_status": status,
                              "diagnostic": end_result.diagnostic}
@@ -881,7 +910,9 @@ class CompletionDetector:
             if not conv_id or (anchor.conversation_id_at_capture
                                and conv_id != anchor.conversation_id_at_capture):
                 return None
-            end = await d._fetch_end_turn_for_turn(conv_id, anchor, had_non_text_content=False)
+            from .projection_diagnostics import projection_phase
+            with projection_phase("phase_1_completion_and_text"):
+                end, text = await d._fetch_turn_results(conv_id, anchor)
             status = collapse_to_end_turn_status(end)
             check = {"raw_status": end.status, "collapsed_status": status, "diagnostic": end.diagnostic}
             recent_checks.append(check)
@@ -891,13 +922,14 @@ class CompletionDetector:
             if (status != "complete" or end.diagnostic.get("user_node") != captured_id
                     or not end.diagnostic.get("assistant_node")):
                 return None
-            text = await d._fetch_text_for_turn(conv_id, anchor)
             if (text.status != "matched" or not isinstance(text.text, str) or not text.text.strip()
                     or text.diagnostic.get("user_node") != captured_id
                     or text.diagnostic.get("assistant_node") != end.diagnostic["assistant_node"]):
                 return None
             _completion_trace("phase_1_backend_complete", conv_id_for_check=conv_id,
                               text_length=len(text.text), diagnostic=text.diagnostic, **_anchor_evidence(anchor))
+            self._completed_turn_text = _CompletedTurnText(
+                conv_id, anchor, captured_id, end.diagnostic["assistant_node"], text.text)
             return text.text
         except (AuthExpiredError, ObservationRateLimitError):
             raise  # auth/rate-limit observation never unlocks a fallback
