@@ -26,6 +26,13 @@ def setup(monkeypatch, *, captured="new-user", end_status="matched", text_status
         end_status, {"user_node": end_user, "assistant_node": end_assistant, "reason": "text_end_turn"}))
     driver._fetch_text_for_turn = AsyncMock(return_value=TurnTextResult(
         text_status, text, {"user_node": text_user, "assistant_node": text_assistant}))
+    async def shared(*_):
+        end = driver._fetch_end_turn_for_turn.return_value
+        text_result = driver._fetch_text_for_turn.return_value
+        if driver._fetch_end_turn_for_turn.side_effect:
+            raise driver._fetch_end_turn_for_turn.side_effect
+        return end, text_result
+    driver._fetch_turn_results = AsyncMock(side_effect=shared)
 
     async def js(expression):
         if "body.innerText" in expression:
@@ -51,8 +58,9 @@ async def test_completed_exact_turn_without_dom_nodes(monkeypatch, expected_conv
     assert [chunk.delta for chunk in chunks] == ["new reply"]
     assert detector.last_dom_text == "new reply"
     assert not detector.had_non_text_content
-    driver._fetch_end_turn_for_turn.assert_awaited_once_with("conv", anchor, had_non_text_content=False)
-    driver._fetch_text_for_turn.assert_awaited_once_with("conv", anchor)
+    driver._fetch_turn_results.assert_awaited_once_with("conv", anchor)
+    driver._fetch_end_turn_for_turn.assert_not_awaited()
+    driver._fetch_text_for_turn.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -79,7 +87,7 @@ async def test_stale_wrong_or_unproven_identity_fails_closed(monkeypatch, change
         await collect(detector, anchor)
     assert detector.last_dom_text == ""
     if changes.get("captured", "present") is None or "conversation" in changes:
-        driver._fetch_end_turn_for_turn.assert_not_awaited()
+        driver._fetch_turn_results.assert_not_awaited()
 
 
 @pytest.mark.asyncio

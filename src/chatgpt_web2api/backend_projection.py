@@ -40,11 +40,38 @@ TURN_PROJECTION_LIMIT = int(os.getenv("W2A_TURN_PROJECTION_LIMIT", "50"))
 # decoded in ``_fetch_recent_conversation_projection``).
 CONVERSATION_PROJECTION_JS = """
 (async function() {
+  var observation = {id: __D.observation_id, phase: __D.phase || 'unspecified', start_ms: Date.now()};
+  function trace(event, status) {
+    if (__D.trace) console.debug('W2A_PROJECTION_READ', JSON.stringify({
+      id: observation.id, phase: observation.phase, event: event,
+      time_ms: Date.now(), status: status == null ? null : status
+    }));
+  }
+  trace('start', null);
   try {
     var r = await fetch('/backend-api/conversation/' + __D.conv_id + '?offset=0&limit=' + __D.limit, {
       headers: {'Authorization': 'Bearer ' + __D.token}
     });
-    if (!r.ok) return JSON.stringify({__status: r.status});
+    if (!r.ok) {
+      var metadata = {}, kind = 'unparsed';
+      try {
+        var errorBody = await r.json();
+        kind = 'json';
+        var error = errorBody.error || errorBody.detail || errorBody;
+        if (error && typeof error === 'object') {
+          for (var field of ['code', 'type']) {
+            if (typeof error[field] === 'string') {
+              var value = error[field];
+              metadata[field] = /^[A-Za-z0-9_.:-]{1,80}$/.test(value) && !/^(eyJ|sk-)/.test(value)
+                ? value : '<redacted>';
+            }
+          }
+        }
+      } catch (_) {}
+      trace('end', r.status);
+      return JSON.stringify({__status: r.status, __retry_after: r.headers.get('Retry-After'),
+        __error_metadata: metadata, __error_kind: kind});
+    }
     var conv = await r.json();
     var mapping = conv.mapping || {};
     var projected = {};
@@ -76,11 +103,13 @@ CONVERSATION_PROJECTION_JS = """
         text: text
       };
     }
+    trace('end', r.status);
     return JSON.stringify({
       nodes: projected,
       current_node: conv.current_node || null
     });
   } catch(e) {
+    trace('end', null);
     return JSON.stringify({__error: String(e)});
   }
 })()

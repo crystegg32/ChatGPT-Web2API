@@ -37,9 +37,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
+import uuid
 
 from .breakers import BreakerKind
+from .projection_diagnostics import current_projection_phase, projection_phase
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +66,27 @@ class _Transient404(Exception):
 # Canonical home moved here from cdp_driver.py in Phase 5 PR1; cdp_driver
 # re-exports it for back-compat.
 TOKEN_TTL_SECONDS = 3600
+
+
+def _exact_completed_parent_chain(mapping, user_id, assistant_id):
+    """Do not trust children links alone for the one-projection handoff."""
+    nodes = mapping.get("nodes", {})
+    user, assistant = nodes.get(user_id, {}), nodes.get(assistant_id, {})
+    if (not user_id or not assistant_id or user.get("id") != user_id
+            or user.get("role") != "user" or assistant.get("id") != assistant_id
+            or assistant.get("role") != "assistant" or assistant.get("end_turn") is not True
+            or not isinstance(assistant.get("text"), str) or not assistant["text"].strip()):
+        return False
+    current, seen = assistant_id, set()
+    while current and current not in seen:
+        if current == user_id:
+            return True
+        seen.add(current)
+        node = nodes.get(current)
+        if not isinstance(node, dict) or node.get("role") == "user":
+            return False
+        current = node.get("parent")
+    return False
 
 
 class BackendClient:
@@ -285,12 +309,22 @@ class BackendClient:
 
         d = self._driver
         await self._driver.ensure_token()
+        phase = current_projection_phase()
+        observation_id = uuid.uuid4().hex
+        trace = os.getenv("W2A_PROJECTION_TRACE") == "1"
+        projection_js = CONVERSATION_PROJECTION_JS
+        if trace:
+            # Passive Network initiator attribution; no HTTP header changes.
+            projection_js += f"\n//# sourceURL=w2a-projection/{phase}/{observation_id}\n"
         raw = await d._js_with_data_strict(
-            CONVERSATION_PROJECTION_JS,
+            projection_js,
             {
                 "conv_id": conversation_id,
                 "token": d._access_token,
                 "limit": TURN_PROJECTION_LIMIT,
+                "phase": phase,
+                "observation_id": observation_id,
+                "trace": trace,
             },
             timeout=15,
         )
@@ -310,9 +344,14 @@ class BackendClient:
             if status == 404:
                 raise _Transient404(conversation_id)
             if status == 429:
+                from .projection_diagnostics import parse_upstream_retry_after, safe_error_metadata
+                retry = parse_upstream_retry_after(payload.get("__retry_after"))
                 raise ObservationRateLimitError(
                     f"ChatGPT backend projection rate limited for {conversation_id}; "
-                    "retry observation later and do not resend the turn."
+                    "retry observation later and do not resend the turn.",
+                    retry_after=retry["seconds"], retry_after_source=retry["source"],
+                    retry_after_reason=retry["reason"], upstream_retry_after=retry["upstream_header"],
+                    upstream_error=safe_error_metadata(payload.get("__error_metadata")),
                 )
             if status is not None:
                 raise RuntimeError(f"projection HTTP {status} for {conversation_id}")
@@ -334,6 +373,31 @@ class BackendClient:
         except (json.JSONDecodeError, TypeError) as e:
             raise CDPJSError(f"projection returned unparseable JSON: {e}") from e
 
+    async def _fetch_turn_results(self, conversation_id, anchor):
+        """Select completion and text from ONE newly fetched projection."""
+        from .cdp_driver import AuthExpiredError, ObservationRateLimitError, CDPJSError
+        from .turn_anchor import select_end_turn_for_turn, select_text_for_turn, TurnEndResult, TurnTextResult
+        try:
+            with projection_phase(current_projection_phase() if current_projection_phase() != "unspecified" else "turn_completion_and_text"):
+                mapping = await self._fetch_recent_conversation_projection(conversation_id)
+            end = select_end_turn_for_turn(mapping, anchor, had_non_text_content=False)
+            text = select_text_for_turn(mapping, anchor)
+            if end.status == "matched" and text.status == "matched":
+                user_id, assistant_id = end.diagnostic.get("user_node"), end.diagnostic.get("assistant_node")
+                if (user_id != getattr(anchor, "captured_user_message_id", None)
+                        or text.diagnostic.get("user_node") != user_id
+                        or text.diagnostic.get("assistant_node") != assistant_id
+                        or not _exact_completed_parent_chain(mapping, user_id, assistant_id)):
+                    diagnostic = {"reason": "exact_parent_chain_not_proven"}
+                    return TurnEndResult("not_ready", diagnostic), TurnTextResult("not_ready", diagnostic=diagnostic)
+            return end, text
+        except (AuthExpiredError, ObservationRateLimitError):
+            raise
+        except _Transient404:
+            return TurnEndResult("not_ready"), TurnTextResult("not_ready")
+        except (CDPJSError, RuntimeError):
+            return TurnEndResult("fetch_failed"), TurnTextResult("fetch_failed")
+
     async def _fetch_text_for_turn(
         self, conversation_id: str, anchor
     ):
@@ -354,7 +418,8 @@ class BackendClient:
         from .turn_anchor import TurnTextResult, select_text_for_turn
 
         try:
-            mapping = await self._fetch_recent_conversation_projection(conversation_id)
+            with projection_phase(current_projection_phase() if current_projection_phase() != "unspecified" else "turn_text"):
+                mapping = await self._fetch_recent_conversation_projection(conversation_id)
             return select_text_for_turn(mapping, anchor)
         except (AuthExpiredError, ObservationRateLimitError):
             raise  # hard fail — auth/rate-limit observation never degrades
@@ -385,7 +450,8 @@ class BackendClient:
         from .turn_anchor import TurnEndResult, select_end_turn_for_turn
 
         try:
-            mapping = await self._fetch_recent_conversation_projection(conversation_id)
+            with projection_phase(current_projection_phase() if current_projection_phase() != "unspecified" else "turn_completion"):
+                mapping = await self._fetch_recent_conversation_projection(conversation_id)
             return select_end_turn_for_turn(
                 mapping, anchor, had_non_text_content=had_non_text_content
             )

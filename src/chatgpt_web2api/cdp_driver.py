@@ -186,6 +186,10 @@ class ObservationRateLimitError(RuntimeError):
         self,
         message: str | None = None,
         retry_after: int = RATE_LIMIT_DEFAULT_RETRY_AFTER,
+        *, retry_after_source: str = "bridge_fallback",
+        retry_after_reason: str | None = "missing_upstream_header",
+        upstream_retry_after: str | None = None,
+        upstream_error: dict | None = None,
     ) -> None:
         if message is None:
             message = (
@@ -194,6 +198,11 @@ class ObservationRateLimitError(RuntimeError):
             )
         super().__init__(message)
         self.retry_after = int(retry_after)
+        self.retry_after_source = retry_after_source
+        self.retry_after_reason = retry_after_reason
+        self.upstream_retry_after = upstream_retry_after
+        from .projection_diagnostics import safe_error_metadata
+        self.upstream_error = safe_error_metadata(upstream_error)
 
 
 class AuthExpiredError(RuntimeError):
@@ -1702,7 +1711,9 @@ class CDPDriver:
 
         # Existing conversation — fetch the pre-send backend mapping for anchor.
         try:
-            mapping = await self._backend_client._fetch_recent_conversation_projection(conv_id)
+            from .projection_diagnostics import projection_phase
+            with projection_phase("pre_send_baseline"):
+                mapping = await self._backend_client._fetch_recent_conversation_projection(conv_id)
             nodes = mapping.get("nodes") or {}
             self._pre_send_user_ids = {node.get("id") or nid for nid, node in nodes.items()
                                        if node.get("role") == "user"}
@@ -1889,7 +1900,12 @@ class CDPDriver:
                 last_status = "not_ready"
                 last_diagnostic = {}
                 for _ in range(60):
-                    result = await self._fetch_text_for_turn(conv_id, turn_anchor)
+                    result = getattr(self._completion, "take_completed_turn_text", lambda *_: None)(conv_id, turn_anchor)
+                    from .turn_anchor import TurnTextResult
+                    if not isinstance(result, TurnTextResult):
+                        from .projection_diagnostics import projection_phase
+                        with projection_phase("driver_final_text"):
+                            result = await self._fetch_text_for_turn(conv_id, turn_anchor)
                     last_status = result.status
                     last_diagnostic = result.diagnostic or {}
                     if result.status == "matched" and result.text:
@@ -1943,6 +1959,9 @@ class CDPDriver:
                 capture_scope.close()
 
         yield StreamChunk(delta="", finish_reason="stop")
+
+    async def _fetch_turn_results(self, conversation_id: str, anchor):
+        return await self._backend_client._fetch_turn_results(conversation_id, anchor)
 
     async def _fetch_text_for_turn(self, conversation_id: str, anchor):
         """A2 anchored final-text fetch. Delegated to BackendClient.
