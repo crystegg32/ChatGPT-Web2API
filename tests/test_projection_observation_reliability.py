@@ -60,6 +60,35 @@ def anchor():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('order', [('a', 'new'), ('new', 'a')])
+@pytest.mark.parametrize('new_time', [13, 12])
+async def test_completed_text_selectors_agree_before_exact_phase_one_handoff(order, new_time):
+    data = mapping()
+    data['nodes']['r']['children'] = list(order)
+    data['nodes']['new'] = {
+        **data['nodes']['a'], 'id': 'new', 'create_time': new_time, 'text': 'new reply',
+    }
+    # Equal timestamps retain the existing text selector's traversal-order tie rule.
+    expected_id = 'new' if new_time > 12 else order[0]
+    expected_text = data['nodes'][expected_id]['text']
+    client, driver = client_with(data)
+    end, text = await client._fetch_turn_results('conv', anchor())
+    assert end.status == text.status == 'matched'
+    assert end.diagnostic['assistant_node'] == text.diagnostic['assistant_node'] == expected_id
+    assert end.diagnostic['user_node'] == text.diagnostic['user_node'] == 'u'
+    driver._js_with_data_strict.reset_mock()
+    driver._get_live_conversation_id_best_effort = AsyncMock(return_value='conv')
+    driver._fetch_turn_results = client._fetch_turn_results
+    detector = CompletionDetector(driver)
+    assert await detector._phase_one_backend_text(driver, anchor(), []) == expected_text
+    driver._js_with_data_strict.assert_awaited_once()
+    cached = detector.take_completed_turn_text('conv', anchor())
+    assert cached.diagnostic['assistant_node'] == expected_id
+    assert cached.text == expected_text
+    assert detector.take_completed_turn_text('conv', anchor()) is None
+
+
+@pytest.mark.asyncio
 async def test_same_fresh_projection_drives_both_selectors_and_one_use_handoff():
     client,driver=client_with(mapping())
     driver._get_live_conversation_id_best_effort=AsyncMock(return_value='conv')
