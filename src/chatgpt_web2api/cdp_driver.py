@@ -1866,6 +1866,7 @@ class CDPDriver:
             # P1: pass budgets + model for the model-aware two-state phase-2
             # machine. When None (no config available), the detector uses the
             # legacy single PHASE_STALL_SECONDS behavior.
+            emitted_text = ""
             async for chunk in self._completion.stream_until_complete(
                 initial_count=initial_count,
                 timeout=timeout,
@@ -1873,6 +1874,7 @@ class CDPDriver:
                 budgets=budgets,
                 model=model,
             ):
+                emitted_text += chunk.delta
                 yield chunk
 
             # Wait for URL to become /c/{id}
@@ -1909,9 +1911,25 @@ class CDPDriver:
                     last_status = result.status
                     last_diagnostic = result.diagnostic or {}
                     if result.status == "matched" and result.text:
-                        if len(result.text) > len(last_dom_text):
-                            yield StreamChunk(delta=result.text[len(last_dom_text):])
-                            last_dom_text = result.text
+                        # Append-only consumers cannot retract earlier chunks.
+                        # Verify both the last DOM snapshot AND actual emitted
+                        # aggregate: DOM revisions/shrinkage can make them differ.
+                        if (not result.text.startswith(last_dom_text)
+                                or not result.text.startswith(emitted_text)):
+                            raise TurnReconciliationError(
+                                conversation_id=conv_id,
+                                anchor_mode=turn_anchor.mode,
+                                last_status="text_mismatch",
+                                diagnostic={
+                                    "reason": "streamed_text_not_backend_prefix",
+                                    "dom_text_length": len(last_dom_text),
+                                    "emitted_text_length": len(emitted_text),
+                                    "backend_text_length": len(result.text),
+                                },
+                            )
+                        if len(result.text) > len(emitted_text):
+                            yield StreamChunk(delta=result.text[len(emitted_text):])
+                        last_dom_text = result.text
                         break
                     if result.status == "non_text":
                         # P2.5 RCA fix: non_text is NOT terminal here. The backend
