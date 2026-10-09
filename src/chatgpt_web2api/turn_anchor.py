@@ -546,9 +546,10 @@ def select_end_turn_for_turn(
         and _node_end_turn(node)
     ]
     if text_end_turn:
+        best = max(text_end_turn, key=lambda pair: _node_create_time(pair[1]))
         return TurnEndResult("matched", diagnostic={
             "user_node": user_nid,
-            "assistant_node": text_end_turn[0][0],
+            "assistant_node": best[0],
             "reason": "text_end_turn",
         })
 
