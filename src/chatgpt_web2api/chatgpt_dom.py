@@ -299,9 +299,10 @@ class ChatGPTDom:
                 from .cdp_driver import SendReadinessError
 
                 raise SendReadinessError(
-                    f"Composer text verification failed after retry; expected {text[:60]!r}"
+                    "Composer text verification failed after retry"
                 )
-        logger.info("Typed: %s", text[:80])
+        from .cdp_diagnostics import utf8_size
+        logger.info("Typed: characters=%d utf8_bytes=%s", len(text), utf8_size(text))
 
     async def _detect_select_all_modifier(self) -> int:
         """Return the CDP modifiers value for select-all on the live platform.

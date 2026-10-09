@@ -46,6 +46,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+from collections import OrderedDict
+
+from .cdp_diagnostics import utf8_size
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +65,20 @@ class CDPTransport:
 
     def __init__(self, driver) -> None:
         self._driver = driver
+        # Metadata only; never retain command params or response bodies.
+        self._observations = OrderedDict()
+
+    def _observe(self, record, phase):
+        reader = getattr(self._driver, "_reader_task", None)
+        data = {k: v for k, v in record.items() if k != "started"}
+        data.update(phase=phase, elapsed_ms=round((time.monotonic() - record["started"]) * 1000, 3),
+                    pending_count=len(self._driver._pending),
+                    reader_done=reader.done() if isinstance(reader, asyncio.Task) else None,
+                    reader_cancelled=reader.cancelled() if isinstance(reader, asyncio.Task) else None)
+        level = logging.INFO if record["method"] == "Input.insertText" or phase in {
+            "timeout", "cancelled", "send_error", "late_response"
+        } else logging.DEBUG
+        logger.log(level, "CDP_STAGE %s", json.dumps(data, sort_keys=True))
 
     # ── CDP primitives ────────────────────────────────────────
 
@@ -113,7 +131,13 @@ class CDPTransport:
                         elif logger.isEnabledFor(logging.DEBUG):
                             logger.debug("CDP event: %s", method)
                     continue
+                if type(mid) is not int:
+                    continue
                 fut = d._pending.pop(mid, None)
+                record = self._observations.pop(mid, None)
+                if record is not None:
+                    record["response_kind"] = "cdp_error" if "error" in msg else "result"
+                    self._observe(record, "response" if fut and not fut.done() else "late_response")
                 if fut and not fut.done():
                     fut.set_result(msg)
                 else:
@@ -121,7 +145,7 @@ class CDPTransport:
         except Exception as e:
             # Socket closed or errored — fail all pending callers so they
             # don't hang waiting for a response that will never arrive.
-            logger.warning("CDP reader loop ended: %s", e)
+            logger.warning("CDP reader loop ended: %s pending_count=%d", type(e).__name__, len(d._pending))
             for mid, fut in list(d._pending.items()):
                 if not fut.done():
                     fut.set_exception(e)
@@ -152,20 +176,45 @@ class CDPTransport:
         mid = d._msg_id
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         d._pending[mid] = fut
+        record = {"id": mid, "method": method if method in {
+            "Input.insertText", "Input.dispatchKeyEvent", "Runtime.evaluate"
+        } else "other", "timeout_seconds": timeout, "started": time.monotonic()}
+        if method == "Input.insertText" and isinstance((params or {}).get("text"), str):
+            text = params["text"]
+            record.update(text_characters=len(text), text_utf8_bytes=utf8_size(text))
+        self._observations[mid] = record
+        while len(self._observations) > 128:
+            self._observations.popitem(last=False)
+        self._observe(record, "start")
         try:
-            await d._ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
-        except Exception as e:
+            try:
+                await d._ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+            except Exception as e:
+                d._pending.pop(mid, None)
+                self._observations.pop(mid, None)
+                self._observe(record, "send_error")
+                if _retry and self._should_reconnect(e):
+                    logger.warning("CDP send failed (%s); reconnecting and retrying once", type(e).__name__)
+                    await d.reconnect()
+                    return await self._cdp(method, params, timeout, _retry=False)
+                raise
+            record["send_complete_ms"] = round((time.monotonic() - record["started"]) * 1000, 3)
+            self._observe(record, "sent")
+            try:
+                return await asyncio.wait_for(fut, timeout)
+            except TimeoutError:
+                d._pending.pop(mid, None)
+                self._observe(record, "timeout")
+                raise TimeoutError(f"CDP timeout: {method}") from None
+        except asyncio.CancelledError:
             d._pending.pop(mid, None)
-            if _retry and self._should_reconnect(e):
-                logger.warning("CDP send failed (%s); reconnecting and retrying once", e)
-                await d.reconnect()
-                return await self._cdp(method, params, timeout, _retry=False)
+            self._observe(record, "cancelled")
             raise
-        try:
-            return await asyncio.wait_for(fut, timeout)
-        except TimeoutError:
+        finally:
+            # Also clean caller cancellation while websocket.send is pending.
             d._pending.pop(mid, None)
-            raise TimeoutError(f"CDP timeout: {method}")
+            if not fut.done():
+                fut.cancel()
 
     @staticmethod
     def _should_reconnect(exc: Exception) -> bool:
