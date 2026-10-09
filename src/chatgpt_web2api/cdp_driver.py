@@ -173,6 +173,38 @@ class RateLimitError(RuntimeError):
         return cls(retry_after=retry_after)
 
 
+class ObservationRateLimitError(RuntimeError):
+    """Backend observation/read was rate limited after a send may have occurred.
+
+    Unlike RateLimitError, this MUST NOT be caught by retry_on_rate_limit(),
+    because retrying the surrounding send operation could duplicate an
+    uncertain/already-delivered user turn. Callers should surface this as
+    HTTP/MCP 429 and retry observation later, never resend automatically.
+    """
+
+    def __init__(
+        self,
+        message: str | None = None,
+        retry_after: int = RATE_LIMIT_DEFAULT_RETRY_AFTER,
+        *, retry_after_source: str = "bridge_fallback",
+        retry_after_reason: str | None = "missing_upstream_header",
+        upstream_retry_after: str | None = None,
+        upstream_error: dict | None = None,
+    ) -> None:
+        if message is None:
+            message = (
+                "ChatGPT backend observation rate limit reached. "
+                f"Retry observation in {retry_after}s; do not resend the turn."
+            )
+        super().__init__(message)
+        self.retry_after = int(retry_after)
+        self.retry_after_source = retry_after_source
+        self.retry_after_reason = retry_after_reason
+        self.upstream_retry_after = upstream_retry_after
+        from .projection_diagnostics import safe_error_metadata
+        self.upstream_error = safe_error_metadata(upstream_error)
+
+
 class AuthExpiredError(RuntimeError):
     """Raised when the ChatGPT access token is stale or rejected (HTTP 401).
 
@@ -1596,7 +1628,8 @@ class CDPDriver:
         Polls briefly (3s at 0.5s intervals). Never raises.
         """
         import time as _time
-        from .chatgpt_dom import COMPOSER_SELECTOR, COMPOSER_FALLBACK_SELECTOR
+
+        from .chatgpt_dom import COMPOSER_FALLBACK_SELECTOR, COMPOSER_SELECTOR
 
         pre_send_count = getattr(self, "_pre_send_user_count", None)
         if pre_send_count is None:
@@ -1665,6 +1698,7 @@ class CDPDriver:
         from .turn_anchor import TurnAnchor
 
         pre_send_wall = _time.time()
+        self._pre_send_user_ids = None
         conv_id = self._current_conv_id
 
         if conv_id is None:
@@ -1677,8 +1711,12 @@ class CDPDriver:
 
         # Existing conversation — fetch the pre-send backend mapping for anchor.
         try:
-            mapping = await self._backend_client._fetch_recent_conversation_projection(conv_id)
+            from .projection_diagnostics import projection_phase
+            with projection_phase("pre_send_baseline"):
+                mapping = await self._backend_client._fetch_recent_conversation_projection(conv_id)
             nodes = mapping.get("nodes") or {}
+            self._pre_send_user_ids = {node.get("id") or nid for nid, node in nodes.items()
+                                       if node.get("role") == "user"}
             # Find latest user + assistant nodes by create_time.
             latest_user_id, latest_user_ct = None, None
             latest_asst_id, latest_asst_ct = None, None
@@ -1758,8 +1796,11 @@ class CDPDriver:
         # The fallback anchor captures pre-send state (backend node-ids/times
         # or wall-clock) for dual-anchor correlation if UUID capture fails.
         fallback_anchor = await self._capture_pre_send_fallback_anchor(text)
+        from .send_confirmation import observe_send
+        await observe_send(self, "before_type", text, fallback_anchor)
         if self._identity_listener is not None and self._identity_listener.is_alive():
             capture_scope = self._identity_listener.arm_capture_scope(
+                expected_text=text,
                 expected_text_hash=hash_sent_text(text),
                 conversation_id=self._current_conv_id,
                 target_id=self._target_id,
@@ -1768,12 +1809,17 @@ class CDPDriver:
         try:
             # Type and send.
             await self.type_message(text)
-            await self.click_send()
+            await observe_send(self, "before_click", text, fallback_anchor)
+            click_result = await self.click_send()
+            await observe_send(self, "after_click", text, fallback_anchor,
+                               click_result=getattr(self, "_last_send_click_result", click_result))
 
             # A2 Step 6: wait for the IdentityListener to capture the UUID.
             captured_uuid = None
             if capture_scope is not None:
                 captured_uuid = await self._identity_listener.wait_for_captured_uuid(timeout=5.0)
+            await observe_send(self, "identity_wait_done", text,
+                               fallback_anchor.with_captured_id(captured_uuid))
 
             # P0 send acknowledgment (ChatGPT review, conv 6a52f0f3):
             # click_send dispatches synthetic mouse events — that proves the
@@ -1793,12 +1839,18 @@ class CDPDriver:
                 try:
                     acknowledged = await self._verify_send_acknowledged()
                     if acknowledged is False:  # explicitly False, not None
-                        raise SendReadinessError(
-                            "Send not acknowledged — click dispatched but no user "
-                            "message appeared (no UUID captured, user count unchanged, "
-                            "composer not cleared). The page may be overloaded or the "
-                            "send was rejected. Do NOT retry automatically."
-                        )
+                        await observe_send(self, "confirmation_timeout", text, fallback_anchor)
+                        from .send_confirmation import reconcile_send
+                        captured_uuid = await reconcile_send(self, fallback_anchor, capture_scope)
+                        if not captured_uuid:
+                            raise SendReadinessError(
+                                "Send not acknowledged — no submitted identity or unique new "
+                                "backend user turn with full matching text and cleared composer "
+                                "could be confirmed within the bounded reconciliation budget. "
+                                "Do NOT retry automatically."
+                            )
+                except AuthExpiredError:
+                    raise
                 except SendReadinessError:
                     raise
                 except Exception as ack_err:
@@ -1814,6 +1866,7 @@ class CDPDriver:
             # P1: pass budgets + model for the model-aware two-state phase-2
             # machine. When None (no config available), the detector uses the
             # legacy single PHASE_STALL_SECONDS behavior.
+            emitted_text = ""
             async for chunk in self._completion.stream_until_complete(
                 initial_count=initial_count,
                 timeout=timeout,
@@ -1821,6 +1874,7 @@ class CDPDriver:
                 budgets=budgets,
                 model=model,
             ):
+                emitted_text += chunk.delta
                 yield chunk
 
             # Wait for URL to become /c/{id}
@@ -1848,13 +1902,34 @@ class CDPDriver:
                 last_status = "not_ready"
                 last_diagnostic = {}
                 for _ in range(60):
-                    result = await self._fetch_text_for_turn(conv_id, turn_anchor)
+                    result = getattr(self._completion, "take_completed_turn_text", lambda *_: None)(conv_id, turn_anchor)
+                    from .turn_anchor import TurnTextResult
+                    if not isinstance(result, TurnTextResult):
+                        from .projection_diagnostics import projection_phase
+                        with projection_phase("driver_final_text"):
+                            result = await self._fetch_text_for_turn(conv_id, turn_anchor)
                     last_status = result.status
                     last_diagnostic = result.diagnostic or {}
                     if result.status == "matched" and result.text:
-                        if len(result.text) > len(last_dom_text):
-                            yield StreamChunk(delta=result.text[len(last_dom_text):])
-                            last_dom_text = result.text
+                        # Append-only consumers cannot retract earlier chunks.
+                        # Verify both the last DOM snapshot AND actual emitted
+                        # aggregate: DOM revisions/shrinkage can make them differ.
+                        if (not result.text.startswith(last_dom_text)
+                                or not result.text.startswith(emitted_text)):
+                            raise TurnReconciliationError(
+                                conversation_id=conv_id,
+                                anchor_mode=turn_anchor.mode,
+                                last_status="text_mismatch",
+                                diagnostic={
+                                    "reason": "streamed_text_not_backend_prefix",
+                                    "dom_text_length": len(last_dom_text),
+                                    "emitted_text_length": len(emitted_text),
+                                    "backend_text_length": len(result.text),
+                                },
+                            )
+                        if len(result.text) > len(emitted_text):
+                            yield StreamChunk(delta=result.text[len(emitted_text):])
+                        last_dom_text = result.text
                         break
                     if result.status == "non_text":
                         # P2.5 RCA fix: non_text is NOT terminal here. The backend
@@ -1902,6 +1977,9 @@ class CDPDriver:
                 capture_scope.close()
 
         yield StreamChunk(delta="", finish_reason="stop")
+
+    async def _fetch_turn_results(self, conversation_id: str, anchor):
+        return await self._backend_client._fetch_turn_results(conversation_id, anchor)
 
     async def _fetch_text_for_turn(self, conversation_id: str, anchor):
         """A2 anchored final-text fetch. Delegated to BackendClient.

@@ -89,6 +89,7 @@ class CaptureScope:
         self.send_sequence_id = send_sequence_id
         self._future: asyncio.Future[CaptureResult] | None = None
         self._closed = False
+        self.expected_text: str | None = None
 
     def _arm(self) -> None:
         """Resolve the wait future when a result lands or the scope closes."""
@@ -212,6 +213,7 @@ class IdentityListener:
         expected_text_hash: str,
         conversation_id: str | None,
         target_id: str | None,
+        expected_text: str | None = None,
     ) -> CaptureScope:
         """Arm a fresh capture scope before ``click_send``.
 
@@ -228,6 +230,7 @@ class IdentityListener:
             send_sequence_id=self._send_sequence,
         )
         scope._arm()
+        scope.expected_text = expected_text
         # Replace any stale active scope (shouldn't happen if close() is used
         # correctly, but defensive).
         if self._active_scope is not None and not self._active_scope._closed:
@@ -249,7 +252,7 @@ class IdentityListener:
         if scope is None or scope.future is None:
             return None
         try:
-            result = await asyncio.wait_for(scope.future, timeout=timeout)
+            result = await asyncio.wait_for(asyncio.shield(scope.future), timeout=timeout)
             return result.uuid
         except TimeoutError:
             self.capture_missed_count += 1
@@ -346,15 +349,19 @@ class IdentityListener:
             # text-hash match if available (failure-mode D: multiple POSTs).
             parts = (m0.get("content") or {}).get("parts") or []
             body_text = "\n".join(str(p) for p in parts if isinstance(p, str))
-            if body_text:
-                body_hash = hashlib.sha256(body_text.encode("utf-8")).hexdigest()
-                if body_hash != scope.expected_text_hash:
-                    # Text doesn't match — could be a different send (retry,
-                    # regenerate). Don't resolve; leave scope open.
+            if not body_text:
+                self._record_fallback_reason("submitted_text_missing")
+                return
+            body_hash = hashlib.sha256(body_text.encode("utf-8")).hexdigest()
+            if body_hash != scope.expected_text_hash:
+                from .send_text import submitted_text_matches
+                if scope.expected_text and submitted_text_matches(body_text, scope.expected_text):
+                    logger.info("identity_capture_serialized_text_match: uuid=%s seq=%d",
+                                uuid, scope.send_sequence_id)
+                else:
+                    # A different send must leave this scope unresolved.
                     logger.debug(
-                        "identity_capture: text hash mismatch (expected %s, got %s) — "
-                        "not our send, leaving scope open",
-                        scope.expected_text_hash[:12], body_hash[:12],
+                        "identity_capture: text hash mismatch — not our send, leaving scope open"
                     )
                     return
 

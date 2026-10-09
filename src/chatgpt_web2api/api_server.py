@@ -22,6 +22,7 @@ from .cdp_driver import (
     AuthExpiredError,
     CDPDriver,
     GenerationStuckError,
+    ObservationRateLimitError,
     RateLimitError,
     is_rate_limited_text,
 )
@@ -437,8 +438,16 @@ class APIServer:
         - Everything else stays a 500 ``server_error`` (a real failure, not
           retriable).
         """
-        if isinstance(exc, RateLimitError):
+        if isinstance(exc, (RateLimitError, ObservationRateLimitError)):
             retry_after = str(int(exc.retry_after))
+            metadata = {}
+            headers = {"Retry-After": retry_after}
+            if isinstance(exc, ObservationRateLimitError):
+                metadata = {"retry_after_source": exc.retry_after_source,
+                            "retry_after_reason": exc.retry_after_reason,
+                            "upstream_retry_after": exc.upstream_retry_after,
+                            "upstream_error": exc.upstream_error}
+                headers["X-Bridge-Retry-After-Source"] = exc.retry_after_source
             return web.json_response(
                 {
                     "error": {
@@ -446,10 +455,11 @@ class APIServer:
                         "type": "rate_limit_exceeded",
                         "param": None,
                         "code": "rate_limit_exceeded",
+                        **metadata,
                     }
                 },
                 status=429,
-                headers={"Retry-After": retry_after},
+                headers=headers,
             )
         if isinstance(exc, AuthExpiredError):
             return web.json_response(
@@ -686,10 +696,9 @@ class APIServer:
                             ],
                         },
                     )
-        except RateLimitError as e:
-            # Mid-stream throttle (rare after pre-flight). Status is locked at
-            # 200, so we can't upgrade to 429; surface as an inline error chunk
-            # with a recognizable marker so clients can detect it.
+        except (RateLimitError, ObservationRateLimitError) as e:
+            # Mid-stream throttle / observation throttling after HTTP 200.
+            # Never retry the send here; surface an inline error marker.
             logger.warning("Mid-stream rate limit: %s", e)
             await self._send_sse(
                 resp,
