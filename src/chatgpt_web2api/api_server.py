@@ -307,15 +307,17 @@ class APIServer:
         model_slug = MODEL_MAP.get(model, model)
         timeout = self._config.server.request_timeout
 
+        from .cdp_diagnostics import utf8_size
         logger.info(
-            "Request #%d: model=%s->%s conv=%s project=%s stream=%s msg=%.60s",
+            "Request #%d: model=%s->%s conv=%s project=%s stream=%s characters=%d utf8_bytes=%s",
             self._request_count,
             model,
             model_slug,
             conversation_id,
             project_id,
             stream,
-            full_text,
+            len(full_text),
+            utf8_size(full_text),
         )
 
         # Serialize — cross-process lock so MCP + REST don't corrupt each other
